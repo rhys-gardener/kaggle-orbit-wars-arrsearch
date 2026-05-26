@@ -1,0 +1,36 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Editor / IDE
+.claude/scheduled_tasks.lock
+
+# Training outputs
+models/
+data/
+replays/
+logs/
+
+# Weight checkpoints and per-run logs
+**checkpoint**
+**/*.pkl
+weights/*.log
+weights/*.err.log
+weights/*.console.log
+weights/*.csvN
+
+# Generic logs
+*.log
+tmp_v17_*/
+tmp_v17_*.jsonl
+tmp_v17_*.npz
+tmp_v17_*.npz.json
+tmp_v17_*.out
+tmp_v17_*.err
+tmp_v17_*.ps1
+.codex/*.npz
+.codex/*.json
+.codex/*.jsonl
+.codex/*.out
+.codex/*.err
+.claude/settings.local.json

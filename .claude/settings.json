@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kaggle competitions list *)",
+      "Bash(kaggle competitions submissions *)"
+    ]
+  }
+}

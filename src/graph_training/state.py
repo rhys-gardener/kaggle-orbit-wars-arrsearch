@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 
-from main import fleet_speed, intercept, is_orbiting, sun_blocked
+from src.physics import fleet_speed, intercept, is_orbiting, sun_blocked
 
 
 MAX_TURNS = 500

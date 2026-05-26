@@ -34,10 +34,10 @@ Carried forward:
 
 - `main.py` — current submission baseline (v17 scored/ranker). Source of physics
   helpers (`fleet_speed`, `intercept`, `sun_blocked`, `is_orbiting`,
-  `_solve_engine_angle`, `_trajectory_first_hit`) that the geometry cache uses.
-  In the long run we'll extract these into `src/physics.py` and let
-  `main.py` import from there, but the migration is `main.py`-as-is to keep
-  the diff minimal.
+  `_solve_engine_angle`, `_trajectory_first_hit`). PR-1 extracts a copy of
+  these into `src/physics.py` for the training pipeline to import; `main.py`
+  retains its own copies (Kaggle requires a self-contained submission file).
+  A parity test asserts the two copies stay in agreement.
 - `src/graph_training/` — state extraction, action generation, beam search,
   array_env, geometry cache. These are the right primitives for this track;
   what changes is how we *drive* them.
@@ -131,35 +131,73 @@ From `src/graph_training/`:
    [array_env.py:153](../../src/graph_training/array_env.py#L153).
    File: `src/array_search/labels.py`.
 
-6. **Small ranker.** Pointwise or listwise model over
-   `(graph_state, candidate features → score)`. Start with a tiny MLP over
-   the existing 20 planet features + 26 edge features. Train on pairwise
-   losses derived from the rollout labels. PyTorch is already in pyproject.
-   File: `src/array_search/ranker.py`, training driver
-   `scripts/train_ranker.py`.
+6. **Small ranker — candidate-as-row, listwise.** Pointwise MLP over a single
+   candidate's feature vector → scalar score. **The number of planets P never
+   enters the model dimension**; each candidate (an (src, tgt, ships) launch)
+   becomes one input row of ~24 features, and the model is invariant to P and
+   K (number of candidates per turn). Training is listwise: per `(seat, turn)`
+   record, softmax over the K candidate scores, cross-entropy against the
+   rollout-best candidate (with H=60 as the primary label, H=30/120 as
+   auxiliaries). Auxiliary pairwise hinge against bottom-quartile candidates
+   stabilises early training. Architecture: `Linear(m, 64) → ReLU →
+   Linear(64, 64) → ReLU → Linear(64, 1)`. PyTorch is in pyproject.
+   Inference per turn: score every candidate, greedy-pack into an action set
+   within the ship budget (matches `search.py`'s composition logic).
+   Files: `src/array_search/features.py` (candidate row construction),
+   `src/array_search/ranker.py`, training driver `scripts/train_ranker.py`.
 
-7. **Self-improvement loop.** Replace fixed-policy self-play with
-   ranker-vs-ranker self-play, re-cache, re-train. Cadence: cache N states,
-   train K epochs, evaluate ranker vs previous-best in a small array-only
-   tournament, accept if win-rate ≥ 55%. File:
-   `scripts/run_self_play_loop.py`.
+   Per-candidate feature columns (rough cut — finalise in PR-3):
+   - **Target/edge**: `valid_mask`, `eta`, `distance`, `ship_cost_min`,
+     `ship_cost_125pct`, `ship_cost_full`, `target_ships_now`, `target_prod`,
+     `target_owner_rel` (mine/neutral/enemy one-hots), `target_radius`,
+     `target_garrison_at_eta`, `friendly_ships_arriving_before_eta`,
+     `enemy_ships_arriving_before_eta`, `enemy_min_eta_to_target`,
+     `target_prod_rank`,
+     `future_prod_value = target_prod * max(0, MAX_TURNS - step - eta)`,
+     `path_clear (actual_hit_id == target_id)`,
+     `target_orbit_radius`, `target_phase_at_eta (sin/cos)`.
+   - **Source**: `source_ships`, `source_prod`, `source_under_threat`.
+   - **Global (broadcast across rows of one turn)**: `turn_remaining`,
+     `my_planet_share`, `my_prod_share`, `num_players`.
+
+7. **Self-improvement loop — concurrent two-ranker self-play.** No fixed
+   policy in the data path. Maintain two policy networks π_A, π_B, each with
+   its own optimiser and replay buffer. Every game: seats 0/2 use π_A, seats
+   1/3 use π_B (rotate per seed to neutralise positional bias). Each network
+   trains only on its own seats' records, so they diverge stochastically and
+   never collapse to a single self-imitating fixed point.
+
+   **Cold-start**: both networks initialised from random weights. Untrained
+   networks still emit a preference over candidates; the rollout labeller
+   provides ground truth from turn 0. First 2-3 rounds are noisy but the
+   loop is self-bootstrapping — no heuristic baseline in the data path.
+
+   **Acceptance gate**: every K rounds, snapshot π_A and π_B into an
+   **incumbent pool**. Challenger plays the pool (sampled opponents);
+   accept-as-new-best at win-rate ≥ 55% against the pool average. The
+   "previous-best" framing from earlier drafts of this plan is replaced by a
+   small pool to avoid overfitting to one specific opponent.
+
+   File: `scripts/run_self_play_loop.py`. Tournament harness:
+   `scripts/array_tournament.py` (~200 lines: N seeds × seat rotations ×
+   T=300 turns, scored by `score_arrays`).
 
 ## Self-play multi-agent setup
 
-For each scenario, each seat runs an independent policy. Options:
+The data path never uses a fixed policy. Two networks, π_A and π_B, train
+simultaneously off the same games: in a 4-player game seats 0/2 are driven by
+π_A, seats 1/3 by π_B; seat assignment is rotated per seed. Each network
+trains only on its own seats' records.
 
-- **Fixed self-play**: same policy for all seats. Cheapest. Generates correlated
-  states but is fine for the first round.
-- **Diversified self-play**: each seat samples from a pool of policies
-  (current ranker, previous-best ranker, random valid, heuristic). Better
-  state distribution.
-- **League-style**: keep a rotating cast of past rankers and sample from them.
-  Defer until step 7 is working.
+This replaces the older "fixed self-play → diversified → league-style"
+progression. Cold-start is from random weights; first rounds are noisy but
+self-bootstrapping. An **incumbent pool** of past snapshots provides
+opponents for the acceptance gate (see step 7), not the training distribution.
 
-Each `(seat, turn)` becomes one training record. A 4-player game with horizon
-H produces 4·H records. Map diversity comes from seeds. Hitting 10k records:
-~50 seeds × 50 turns × 4 seats. Hitting 1M: ~5k seeds × 50 turns × 4 seats,
-which is still cheap when the loop is array-only.
+Each `(seat, turn)` becomes one training record tagged with `policy_id` (A or
+B) so simultaneous training can route correctly. A 4-player game with horizon
+H produces 4·H records (2·H per network). Map diversity comes from seeds.
+Hitting 10k records: ~50 seeds × 50 turns × 4 seats. Hitting 1M: ~5k seeds.
 
 ## Scoring philosophy
 
@@ -203,14 +241,42 @@ trained, it gets embedded into a new `main.py` the same way the v17 ranker is
 embedded today (look for `_v17_embedded_ranker` in `main.py`). Submission
 process is unchanged — see [CLAUDE.md](../../CLAUDE.md).
 
-## Open questions for the next session
+## Resolved decisions (carried out of the 2026-05-26 scoping session)
 
-1. Do we want to refactor physics out of `main.py` into `src/physics.py`
-   before building the new pipeline, or after? Argument for *before*:
-   `main.py` is 1500+ lines of submission code we don't want to drag through
-   imports. Argument for *after*: refactor risk on a code path we know works.
-2. Choose a starting horizon (30/60/120) and a ranker architecture (linear /
-   MLP / tiny graph net) for step 6.
-3. What does "evaluate ranker vs previous-best" look like in array-only land?
-   We need an array-only tournament harness; the kaggle-env tournament from
-   the old repo doesn't transfer cleanly.
+1. **Physics extraction order**: copy (not move) the 6 helpers into
+   `src/physics.py` **before** the new pipeline. `main.py` keeps its copies
+   (Kaggle requires self-contained submission). Parity test in
+   `tests/test_physics_parity.py` gates drift. Done in PR-1.
+2. **Rollout horizon**: label every action set at H ∈ {30, 60, 120}. **Train
+   against H=60 as the primary head**, with 30 and 120 as auxiliaries.
+3. **Ranker architecture**: candidate-as-row pointwise MLP, listwise softmax
+   loss. See gap 6 for the feature columns. P (planet count) does not enter
+   the model dimension.
+4. **Self-play training**: two networks trained simultaneously (π_A, π_B),
+   never a fixed policy. Cold-start from random weights. See "Self-play
+   multi-agent setup" and gap 7.
+5. **Tournament gate**: array-only `scripts/array_tournament.py`, ~200 lines,
+   no kaggle env. Acceptance threshold 55% against an incumbent pool, not
+   a single previous-best.
+
+## Open questions for later sessions
+
+1. **Action limits.** The current candidate generator (`actions.py`) and
+   beam search (`search.py`) emit fairly liberal action sets — many launches
+   per turn, many ship-bucket variants per launch. Before training the
+   ranker we should pin:
+   - Max launches per turn per seat (e.g. 4? 6? unlimited but penalised?).
+   - Ship-count discretisation per candidate (current: small/medium/full +
+     just-barely-capture). Do we want more granularity, fewer buckets, or a
+     continuous "fraction of source ships" prediction head?
+   - Filtering of low-value candidates pre-scoring (e.g. drop candidates
+     where `enemy_before_eta` dominates by >5×).
+   Picking these wrong makes K explode (slows rollout labelling) or
+   collapses the action set so the ranker has nothing to choose between.
+2. **PR-1 schedule schema bump** — agreed shape:
+   `schedule[absolute_arrival_turn] → list[(source_id, target_id, owner, ships, launch_turn)]`.
+   Existing `_resolve_combat` only cares about `(target_idx, owner, ships)`,
+   so the bump is additive; `state_adapter.arrays_to_obs` is the consumer
+   that reads `source_id` and `launch_turn` to synthesise in-flight fleets.
+3. **Step-0 planet snapshot** stored alongside the array tuple so we can
+   derive each planet's `phase0` without redundant state. Decided yes.

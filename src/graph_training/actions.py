@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from main import _solve_engine_angle, _trajectory_first_hit, intercept
+from src.physics import _solve_engine_angle, _trajectory_first_hit, intercept
 
 from .state import (
     MAX_TURNS,

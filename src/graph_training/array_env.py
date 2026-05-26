@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -23,6 +23,33 @@ class RolloutScore:
     ship_lead: float
     planet_count: int
     alive: bool
+
+
+@dataclass(frozen=True)
+class ScheduledFleet:
+    """One in-flight fleet bound for a specific target.
+
+    Schedule entries used to be ``(target_idx, owner, ships)`` tuples; this
+    expanded form carries the metadata that ``state_adapter.arrays_to_obs``
+    needs to synthesise an obs-shape fleet (``source_idx`` and
+    ``launch_rel_turn``).
+
+    ``launch_rel_turn`` is the rollout-relative turn at which the fleet
+    launched. Freshly scheduled launches have ``launch_rel_turn == 0``;
+    inbound fleets carried over from the snapshot have negative values
+    (``-eta_remaining`` is the natural choice when the engine launch turn
+    is unknown).
+    """
+
+    source_idx: int
+    target_idx: int
+    owner: int
+    ships: int
+    launch_rel_turn: int
+
+
+def _as_triples(arrivals: Iterable[ScheduledFleet]) -> list[tuple[int, int, int]]:
+    return [(int(a.target_idx), int(a.owner), int(a.ships)) for a in arrivals]
 
 
 def _player_count(record: dict[str, Any]) -> int:
@@ -38,11 +65,13 @@ def _candidate_by_index(record: dict[str, Any], idx: int) -> dict[str, Any]:
     return record["candidates"][int(idx)]
 
 
-def initial_arrays(record: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, list[tuple[int, int, int]]]]:
+def initial_arrays(record: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, list[ScheduledFleet]]]:
     """Return owner, ships, production, event_schedule.
 
-    event_schedule maps relative ETA to `(target_index, owner, ships)`.
-    Existing in-flight fleets are loaded from cached inferred events.
+    event_schedule maps relative arrival turn to a list of ``ScheduledFleet``.
+    Existing in-flight fleets are loaded from cached inferred events; their
+    ``launch_rel_turn`` is set to ``-eta`` since the engine launch turn is
+    not preserved in the record.
     """
 
     planets = record["observation"].get("planets", [])
@@ -51,14 +80,23 @@ def initial_arrays(record: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.n
     owners = np.array([int(p[1]) for p in planets], dtype=np.int16)
     ships = np.array([float(p[5]) for p in planets], dtype=np.float32)
     production = np.array([float(p[6]) for p in planets], dtype=np.float32)
-    schedule: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+    schedule: dict[int, list[ScheduledFleet]] = defaultdict(list)
 
     for event in record.get("inbound_events", []):
         target_idx = id_to_index.get(int(event["target_id"]))
         if target_idx is None:
             continue
+        source_idx = id_to_index.get(int(event.get("source_id", -1)), -1)
         eta = max(1, int(event["eta"]))
-        schedule[eta].append((target_idx, int(event["owner"]), int(event["ships"])))
+        schedule[eta].append(
+            ScheduledFleet(
+                source_idx=int(source_idx),
+                target_idx=int(target_idx),
+                owner=int(event["owner"]),
+                ships=int(event["ships"]),
+                launch_rel_turn=-eta,
+            )
+        )
 
     return owners, ships, production, schedule
 
@@ -68,7 +106,9 @@ def schedule_action_set(
     action_set: dict[str, Any],
     owners: np.ndarray,
     ships: np.ndarray,
-    schedule: dict[int, list[tuple[int, int, int]]],
+    schedule: dict[int, list[ScheduledFleet]],
+    *,
+    launch_rel_turn: int = 0,
 ) -> None:
     """Apply launch costs and schedule arrivals for one cached action set."""
 
@@ -88,16 +128,28 @@ def schedule_action_set(
             continue
         ships[src_idx] -= amount
         eta = max(1, int(candidate["eta"]))
-        schedule[eta].append((hit_idx, player, int(amount)))
+        schedule[launch_rel_turn + eta].append(
+            ScheduledFleet(
+                source_idx=int(src_idx),
+                target_idx=int(hit_idx),
+                owner=int(player),
+                ships=int(amount),
+                launch_rel_turn=int(launch_rel_turn),
+            )
+        )
 
 
 def _resolve_combat(
     owners: np.ndarray,
     ships: np.ndarray,
-    arrivals: list[tuple[int, int, int]],
+    arrivals: Iterable[ScheduledFleet] | list[tuple[int, int, int]],
 ) -> None:
     by_target: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-    for target_idx, owner, amount in arrivals:
+    for entry in arrivals:
+        if isinstance(entry, ScheduledFleet):
+            target_idx, owner, amount = entry.target_idx, entry.owner, entry.ships
+        else:
+            target_idx, owner, amount = entry
         by_target[int(target_idx)][int(owner)] += int(amount)
 
     for target_idx, player_ships in by_target.items():

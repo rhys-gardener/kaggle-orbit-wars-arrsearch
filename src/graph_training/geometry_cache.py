@@ -23,7 +23,7 @@ from typing import Any
 
 import numpy as np
 
-from main import _solve_engine_angle, _trajectory_first_hit, intercept
+from src.physics import _solve_engine_angle, _trajectory_first_hit, intercept
 
 
 REASON_CODES = {

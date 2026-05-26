@@ -156,7 +156,14 @@ From `src/graph_training/`:
      `future_prod_value = target_prod * max(0, MAX_TURNS - step - eta)`,
      `path_clear (actual_hit_id == target_id)`,
      `target_orbit_radius`, `target_phase_at_eta (sin/cos)`.
+   - **Defence-specific**: `target_is_my_threatened_planet` (target_owner_mine
+     AND target_under_threat). Added because replay analysis shows 72% of
+     winning launches target the agent's own planets — a dedicated feature
+     gives the model a direct head into the defence decision.
    - **Source**: `source_ships`, `source_prod`, `source_under_threat`.
+   - **Filter-tag flags** (from `ActionFilters` lax tier): `is_below_typical_min_ships`,
+     `is_high_eta_launch`. Marginal candidates that pass the strict cuts but
+     are unusual; the model learns when to use them.
    - **Global (broadcast across rows of one turn)**: `turn_remaining`,
      `my_planet_share`, `my_prod_share`, `num_players`.
 
@@ -259,20 +266,53 @@ process is unchanged — see [CLAUDE.md](../../CLAUDE.md).
    no kaggle env. Acceptance threshold 55% against an incumbent pool, not
    a single previous-best.
 
-## Open questions for later sessions
+## Action filters (data-driven, set 2026-05-26)
 
-1. **Action limits.** The current candidate generator (`actions.py`) and
-   beam search (`search.py`) emit fairly liberal action sets — many launches
-   per turn, many ship-bucket variants per launch. Before training the
-   ranker we should pin:
-   - Max launches per turn per seat (e.g. 4? 6? unlimited but penalised?).
-   - Ship-count discretisation per candidate (current: small/medium/full +
-     just-barely-capture). Do we want more granularity, fewer buckets, or a
-     continuous "fraction of source ships" prediction head?
-   - Filtering of low-value candidates pre-scoring (e.g. drop candidates
-     where `enemy_before_eta` dominates by >5×).
-   Picking these wrong makes K explode (slows rollout labelling) or
-   collapses the action set so the ranker has nothing to choose between.
+Derived from 100 May 24-25 leaderboard replays (41k winning-seat launches).
+Full analysis: [docs/replay_action_stats.md](../replay_action_stats.md).
+Two surprises overturned my initial intuition: (a) small fleets travel
+*further* than big ones in winning play (P95 eta of <25-ship fleets = 70;
+of ≥25-ship fleets = 28), and (b) **72% of winning launches target the
+agent's own planets** — defence is the dominant action type.
+
+### Strict filter (hard reject from candidate space)
+- `eta > 80` — margin above winner P95=57. No useful launches happen here.
+- `ships < 1` — invalid.
+- `ships ≤ 2 AND eta > 40` — excludes "tiny lob across the board"; rarely
+  occurs in winning play and tends to be wasted production.
+
+### Lax filter (admit + feature flag)
+- `ships ≤ 3` → `is_below_typical_min_ships` (~13% of winning launches).
+- `eta > 50` → `is_high_eta_launch` (~7% of winning launches).
+
+These feed into the per-candidate row so the ranker can learn when the
+unusual cases actually win.
+
+### Action-set composition
+- `max_launches_per_turn = 10` (hard cap). P95 of non-empty turns = 11;
+  going much above is noise.
+- `multi_source_bonus = 0.15` — soft additive bonus during action-set
+  composition when ≥2 candidates already in the set share a target. 22.4%
+  of winning multi-launch turns coordinate this way.
+
+### Dropped
+- `min_ships_per_launch` as a hard threshold — winner P05 is 1 ship, and
+  ~28% of winning launches are <8 ships. Hard-filtering them would block
+  legitimate strategy.
+- `min_ships_pct_of_source` — noisy because production accrues between turns
+  (P75 of `ships/garrison_at_launch` = 10.5×). Drop the knob entirely.
+- "Defensive candidate kind" — the candidate space already contains
+  my→my launches via the existing edge loop in `state.py`. The model
+  learns defence via `target_owner_rel` and the new
+  `target_is_my_threatened_planet` flag.
+
+### Ablation hatch
+All filter values live in a `frozen` dataclass; setting `max_eta_strict =
+999, max_launches_per_turn = 99, …` reproduces the unfiltered baseline.
+After the ranker is trained, run one round with the relaxed config to
+test whether the model wants to break any of these rules.
+
+## Open questions for later sessions
 2. **PR-1 schedule schema bump** — agreed shape:
    `schedule[absolute_arrival_turn] → list[(source_id, target_id, owner, ships, launch_turn)]`.
    Existing `_resolve_combat` only cares about `(target_idx, owner, ships)`,

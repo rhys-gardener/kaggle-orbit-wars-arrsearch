@@ -34,3 +34,5 @@ tmp_v17_*.ps1
 .codex/*.out
 .codex/*.err
 .claude/settings.local.json
+.env
+archive.zip

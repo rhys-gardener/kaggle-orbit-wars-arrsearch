@@ -178,6 +178,73 @@ def _resolve_combat(
                 ships[target_idx] = abs(ships[target_idx])
 
 
+@dataclass(frozen=True)
+class PendingLaunch:
+    """A single per-seat launch decision waiting to enter the schedule.
+
+    Used as the input element for ``step_multi_seat``. The arrival time is
+    computed at scheduling time as ``current_rel_turn + eta``.
+    """
+
+    source_idx: int
+    target_idx: int
+    owner: int
+    ships: int
+    eta: int  # turns until arrival
+
+
+def step_multi_seat(
+    owners: np.ndarray,
+    ships: np.ndarray,
+    production: np.ndarray,
+    schedule: dict[int, list[ScheduledFleet]],
+    seat_launches: Iterable[PendingLaunch],
+    *,
+    current_rel_turn: int,
+) -> int:
+    """Apply one turn of multi-seat self-play to the array state in-place.
+
+    Sequence mirrors the engine's per-turn order:
+
+      1. All seats' launches commit simultaneously — ships deducted from
+         each source, ``ScheduledFleet`` entries added to the schedule
+         keyed by ``current_rel_turn + eta``.
+      2. Turn advances: ``new_rel_turn = current_rel_turn + 1``.
+      3. Production accrues at every owned planet.
+      4. Combat resolves for any arrivals at ``new_rel_turn``.
+
+    Planet positions are not stored — they're derived on read by
+    ``planet_positions_at`` whenever an obs is reconstructed.
+
+    Returns ``new_rel_turn`` so callers can chain steps without bookkeeping.
+    """
+    for launch in seat_launches:
+        src = int(launch.source_idx)
+        amount = int(min(int(launch.ships), max(int(ships[src]), 0)))
+        if amount <= 0:
+            continue
+        ships[src] -= amount
+        eta = max(1, int(launch.eta))
+        arrival_rel_turn = int(current_rel_turn) + eta
+        schedule.setdefault(arrival_rel_turn, []).append(
+            ScheduledFleet(
+                source_idx=src,
+                target_idx=int(launch.target_idx),
+                owner=int(launch.owner),
+                ships=amount,
+                launch_rel_turn=int(current_rel_turn),
+            )
+        )
+
+    new_rel_turn = int(current_rel_turn) + 1
+    owned = owners >= 0
+    ships[owned] += production[owned]
+    arrivals = schedule.get(new_rel_turn)
+    if arrivals:
+        _resolve_combat(owners, ships, arrivals)
+    return new_rel_turn
+
+
 def rollout_cached_action_set(
     record: dict[str, Any],
     action_set_index: int,

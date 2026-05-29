@@ -32,8 +32,15 @@ The core bet remains unchanged: use the engine only for initial observations and
 - Module: `src/array_search/mcts_teacher.py`.
 - Operates over whole-turn action sets, not raw launches.
 - Uses rollout value plus optional ranker prior to choose teacher labels.
-- `--mcts-depth 1` is the fast root-action rollout mode.
-- `--mcts-depth > 1` enables policy-response search: evaluate the root action, then simulate future turns where all seats act using the current learned policy before final scoring.
+- Policy-response only: `--mcts-depth >= 2` is required (`< 2` is rejected). The
+  redundant passive root-rollout mode was removed — the base labeller
+  (`labels.label_record`) already passive-rolls every action set for free, so the
+  teacher exists solely to add active future play the base loop cannot produce.
+- `--mcts-opponent-samples N` (now live; was reserved) branches the rollout over
+  N stochastic opponent continuations (opponents play the learned policy with
+  `softmax_temperature` exploration) and aggregates with `--mcts-aggregate`
+  (`mean` = expected value, `min` = worst-case/adversarial). N=1 collapses to a
+  single greedy line.
 - Emits labels in the same candidate-positive shape used by the ranker.
 
 ### Self-play league
@@ -47,7 +54,11 @@ The core bet remains unchanged: use the engine only for initial observations and
 
 ## Caveats
 
-- The current MCTS teacher supports root-action search and a v1 policy-response depth mode. It still is not a full UCT tree with branching opponent expansion; future turns are played by the current learned policy rather than exhaustively searched. `opponent_samples` is still reserved for a later stochastic/policy-mix expansion.
+- The MCTS teacher is policy-response with stochastic opponent-sampling branching
+  (`opponent_samples` continuations aggregated by mean/min). It is still not a
+  full UCT tree: future turns are played by the current learned policy (sampled),
+  not selected by UCB over an expanded tree, and there is no backprop/tree reuse.
+  A full UCT implementation remains future work.
 - Sparse geometry is exact but can have a cold-start cost on the first game for a map. Reusing maps amortizes this, and the cache persists as `.npz`.
 - Replay bootstrap currently uses downloaded/local replay JSONs only. More replays can be downloaded later through the dataset manifest/Kaggle CLI path.
 - Replay bootstrap currently accumulates all records in memory before writing shards and only writes its manifest at the end. The 200-replay bootstrap run produced 23,025 records across 90 shards, about 2.84 GB, and took about 11.8 hours. Before larger replay runs, add incremental shard flushing plus a `progress.jsonl`/CSV log with replay index, elapsed time, records found, shard writes, and memory use.
@@ -99,9 +110,14 @@ uv run python scripts/run_self_play_loop.py \
   --beam-width 12 \
   --max-engine-steps 100 \
   --mcts-teacher-rate 0.05 \
-  --mcts-root-action-sets 12 \
-  --mcts-depth 1 \
+  --mcts-root-action-sets 8 \
+  --mcts-depth 2 \
+  --mcts-opponent-samples 3 \
+  --mcts-aggregate mean \
   --mcts-rollout-horizon 25 \
+  --explore-temperature 0.5 \
+  --long-horizon-fraction 0.15 \
+  --long-horizon-turns 250 \
   --replay-prior-checkpoint runs/replay_bootstrap_200_001/checkpoints/replay_bootstrap_ranker.pt \
   --map-pool-size 8 \
   --games-per-map 6 \

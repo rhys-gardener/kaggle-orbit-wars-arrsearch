@@ -128,6 +128,8 @@ def greedy_pack_action_set(
     *,
     max_launches: int = 10,
     multi_source_bonus: float = 0.15,
+    temperature: float = 0.0,
+    rng: np.random.Generator | None = None,
 ) -> dict[str, Any]:
     candidates = record.get("candidates", [])
     planet_ids = [int(pid) for pid in record["graph"]["planet_ids"]]
@@ -136,7 +138,15 @@ def greedy_pack_action_set(
     source_budget = {int(p[0]): float(p[5]) for p in planets}
     chosen: list[int] = []
     target_counts: dict[int, int] = {}
-    order = list(np.argsort(-scores))
+    if float(temperature) > 0.0 and len(scores) > 0:
+        # Stochastic exploration: Gumbel-top-k perturbs the greedy ordering so
+        # self-play visits a wider slice of the action space. temperature<=0
+        # leaves the deterministic argsort untouched (eval / submission path).
+        generator = rng if rng is not None else np.random.default_rng()
+        gumbel = -np.log(-np.log(generator.random(len(scores)) + 1e-12) + 1e-12)
+        order = list(np.argsort(-(np.asarray(scores, dtype=np.float64) / float(temperature) + gumbel)))
+    else:
+        order = list(np.argsort(-scores))
     for idx in order:
         if len(chosen) >= int(max_launches):
             break

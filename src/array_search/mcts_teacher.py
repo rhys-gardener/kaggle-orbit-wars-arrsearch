@@ -26,7 +26,6 @@ from src.graph_training.array_env import (
     PendingLaunch,
     RolloutScore,
     ScheduledFleet,
-    rollout_cached_action_set,
     step_multi_seat,
 )
 from src.graph_training.search import generate_action_sets
@@ -37,10 +36,11 @@ from src.graph_training.state import build_graph_state
 class MCTSTeacherConfig:
     root_action_sets: int = 32
     opponent_samples: int = 4
-    depth: int = 1
+    depth: int = 2
     rollout_horizon: int = 30
     prior_weight: float = 0.25
     softmax_temperature: float = 1.0
+    aggregate: str = "mean"  # how to combine opponent-sample rollout scores: mean | min
 
 
 def _action_set_prior(record: dict[str, Any], scores: np.ndarray | None, action_set: dict[str, Any]) -> float:
@@ -167,6 +167,8 @@ def _policy_record_for_state(
     max_same_target: int,
     include_support: bool,
     filters: ActionFilters | None,
+    temperature: float = 0.0,
+    rng: np.random.Generator | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     obs = arrays_to_obs(
         scenario,
@@ -213,11 +215,13 @@ def _policy_record_for_state(
         chosen = dict(max(action_set_records, key=lambda item: float(item.get("score", 0.0))))
     else:
         scores = score_candidates(model, record, device=device)
-        chosen = greedy_pack_action_set(record, scores, max_launches=max_launches)
+        chosen = greedy_pack_action_set(
+            record, scores, max_launches=max_launches, temperature=temperature, rng=rng
+        )
     return record, chosen
 
 
-def _policy_response_rollout_score(
+def _single_policy_response_rollout(
     record: dict[str, Any],
     action_set: dict[str, Any],
     *,
@@ -232,11 +236,15 @@ def _policy_response_rollout_score(
     max_same_target: int,
     include_support: bool,
     filters: ActionFilters | None,
+    temperature: float,
+    rng: np.random.Generator,
 ) -> RolloutScore:
+    """One policy-response rollout: root commits ``action_set``, opponents play
+    the (optionally stochastic) current policy, then passive accrual to horizon."""
     owners, ships, production, schedule = _full_arrays_from_record(scenario, record)
     current_turn = int(record.get("source", {}).get("rel_turn", record.get("graph", {}).get("step", 0)))
     root_player = int(record["graph"]["player"])
-    for depth_idx in range(max(1, int(config.depth))):
+    for depth_idx in range(max(2, int(config.depth))):
         pending: list[PendingLaunch] = []
         for seat in range(int(scenario.num_players)):
             if depth_idx == 0 and seat == root_player:
@@ -258,6 +266,8 @@ def _policy_response_rollout_score(
                 max_same_target=max_same_target,
                 include_support=include_support,
                 filters=filters,
+                temperature=temperature,
+                rng=rng,
             )
             pending.extend(_pending_from_record_action_set(scenario, seat_record, chosen, owner=seat))
         current_turn = step_multi_seat(
@@ -296,9 +306,89 @@ def _policy_response_rollout_score(
     )
 
 
+def _aggregate_rollout_scores(scores: list[RolloutScore], mode: str) -> RolloutScore:
+    """Combine opponent-sample rollouts into one expected score.
+
+    ``mean`` = expected value over sampled opponent play; ``min`` = worst-case
+    (adversarial robustness) for the root player.
+    """
+    if len(scores) == 1:
+        return scores[0]
+    prod = np.array([s.production for s in scores], dtype=np.float64)
+    prod_lead = np.array([s.production_lead for s in scores], dtype=np.float64)
+    ship_total = np.array([s.ship_total for s in scores], dtype=np.float64)
+    ship_lead = np.array([s.ship_lead for s in scores], dtype=np.float64)
+    planets = np.array([s.planet_count for s in scores], dtype=np.float64)
+    alive = np.array([1.0 if s.alive else 0.0 for s in scores], dtype=np.float64)
+    if mode == "min":
+        return RolloutScore(
+            production=float(prod.min()),
+            production_lead=float(prod_lead.min()),
+            ship_total=float(ship_total.min()),
+            ship_lead=float(ship_lead.min()),
+            planet_count=int(planets.min()),
+            alive=bool(alive.min() > 0.0),
+        )
+    return RolloutScore(
+        production=float(prod.mean()),
+        production_lead=float(prod_lead.mean()),
+        ship_total=float(ship_total.mean()),
+        ship_lead=float(ship_lead.mean()),
+        planet_count=int(round(float(planets.mean()))),
+        alive=bool(alive.mean() >= 0.5),
+    )
+
+
+def _policy_response_rollout_score(
+    record: dict[str, Any],
+    action_set: dict[str, Any],
+    *,
+    scenario: InitialScenario,
+    geometry_cache: Any,
+    model: CandidateRanker | None,
+    device: str,
+    config: MCTSTeacherConfig,
+    candidate_limit: int,
+    max_launches: int,
+    beam_width: int,
+    max_same_target: int,
+    include_support: bool,
+    filters: ActionFilters | None,
+    seed: int = 0,
+) -> RolloutScore:
+    """Score a root action by branching over ``opponent_samples`` stochastic
+    opponent continuations and aggregating (mean expected / min worst-case)."""
+    n_samples = max(1, int(config.opponent_samples))
+    temperature = float(config.softmax_temperature) if n_samples > 1 else 0.0
+    results: list[RolloutScore] = []
+    for sample_idx in range(n_samples):
+        rng = np.random.default_rng(int(seed) + sample_idx)
+        results.append(
+            _single_policy_response_rollout(
+                record,
+                action_set,
+                scenario=scenario,
+                geometry_cache=geometry_cache,
+                model=model,
+                device=device,
+                config=config,
+                candidate_limit=candidate_limit,
+                max_launches=max_launches,
+                beam_width=beam_width,
+                max_same_target=max_same_target,
+                include_support=include_support,
+                filters=filters,
+                temperature=temperature,
+                rng=rng,
+            )
+        )
+    return _aggregate_rollout_scores(results, str(config.aggregate))
+
+
 def teach_record_with_mcts(
     record: dict[str, Any],
     *,
+    seed: int = 0,
     model: CandidateRanker | None = None,
     device: str = "cpu",
     config: MCTSTeacherConfig | None = None,
@@ -314,6 +404,14 @@ def teach_record_with_mcts(
     """Attach teacher labels to one record and return it."""
 
     config = config or MCTSTeacherConfig()
+    # Policy-response is the teacher's only distinctive capability: the base
+    # labeller already passive-rolls every action set. Without a scenario +
+    # geometry cache we cannot run active future play, so skip teaching this
+    # record (it keeps its base rollout label) rather than re-doing redundant work.
+    if scenario is None or geometry_cache is None:
+        return record
+    if int(config.depth) < 2:
+        raise ValueError("MCTSTeacherConfig.depth must be >= 2 (policy-response only)")
     action_sets = record.get("action_sets", [])
     if not action_sets:
         attach_positive_candidate_label(record, [], source="mcts", horizon=PRIMARY_HORIZON)
@@ -327,30 +425,23 @@ def teach_record_with_mcts(
     )[: max(1, int(config.root_action_sets))]
 
     evaluated: list[tuple[int, tuple[float, ...], float]] = []
-    use_policy_response = scenario is not None and geometry_cache is not None and int(config.depth) > 1
     for action_idx in root_order:
-        if use_policy_response:
-            score = _policy_response_rollout_score(
-                record,
-                action_sets[int(action_idx)],
-                scenario=scenario,
-                geometry_cache=geometry_cache,
-                model=model,
-                device=device,
-                config=config,
-                candidate_limit=candidate_limit,
-                max_launches=max_launches,
-                beam_width=beam_width,
-                max_same_target=max_same_target,
-                include_support=include_support,
-                filters=filters,
-            )
-        else:
-            _owners, _ships, score = rollout_cached_action_set(
-                record,
-                int(action_idx),
-                horizon=max(1, int(config.rollout_horizon)),
-            )
+        score = _policy_response_rollout_score(
+            record,
+            action_sets[int(action_idx)],
+            scenario=scenario,
+            geometry_cache=geometry_cache,
+            model=model,
+            device=device,
+            config=config,
+            candidate_limit=candidate_limit,
+            max_launches=max_launches,
+            beam_width=beam_width,
+            max_same_target=max_same_target,
+            include_support=include_support,
+            filters=filters,
+            seed=int(seed) + int(action_idx) * 7919,
+        )
         prior = _action_set_prior(record, candidate_scores, action_sets[action_idx])
         key = score_key(score)
         scalar = (
@@ -389,7 +480,8 @@ def teach_record_with_mcts(
         "rollout_horizon": int(config.rollout_horizon),
         "evaluated_action_sets": len(evaluated),
         "best_action_set": best_idx,
-        "mode": "policy_response" if use_policy_response else "root_rollout",
+        "aggregate": str(config.aggregate),
+        "mode": "policy_response",
     }
     return record
 
@@ -420,6 +512,7 @@ def apply_mcts_teacher(
             continue
         teach_record_with_mcts(
             record,
+            seed=int(seed) + applied * 104729,
             model=model,
             device=device,
             config=config,

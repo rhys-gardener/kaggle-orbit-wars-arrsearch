@@ -31,13 +31,29 @@ def parse_ints(text: str) -> list[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
+def resolve_geometry_cache_dir(args) -> Path:
+    """Shared, cross-run geometry cache location (override with --geometry-cache-dir)."""
+    if args.geometry_cache_dir:
+        return Path(args.geometry_cache_dir)
+    return ROOT / "runs" / "_geometry_cache"
+
+
 def build_geometry(scenario, args, *, cache_dir: Path | None = None):
     if args.geometry_mode == "sparse":
         cache_path = None
         if cache_dir is not None:
             cache_dir.mkdir(parents=True, exist_ok=True)
             bucket_tag = "_".join(str(x) for x in parse_ints(args.ship_buckets))
-            cache_path = cache_dir / f"seed_{int(scenario.seed)}_b_{bucket_tag}_sparse.npz"
+            # Key on every input that changes the geometry so a shared cache
+            # never serves a stale map: seed + player count + engine step budget
+            # + ship buckets. (max_steps is baked into the .npz and silently
+            # overrides the run's value on load, so it MUST be in the filename.)
+            cache_path = cache_dir / (
+                f"seed_{int(scenario.seed)}"
+                f"_np_{int(scenario.num_players)}"
+                f"_steps_{int(args.max_engine_steps)}"
+                f"_b_{bucket_tag}_sparse.npz"
+            )
             if cache_path.exists():
                 return SparseGeometryCache.load(cache_path, scenario), cache_path, True
         return (
@@ -88,6 +104,26 @@ def collect_record_paths(text: str) -> list[Path]:
         else:
             out.append(path)
     return out
+
+
+def _latest_common_ranker_round(ckpt_dir: Path) -> tuple[int, Path, Path] | None:
+    a_paths = sorted(ckpt_dir.glob("ranker_A_round_*.pt"))
+    b_paths = sorted(ckpt_dir.glob("ranker_B_round_*.pt"))
+    a_by_round = {_round_from_checkpoint_name(path): path for path in a_paths}
+    b_by_round = {_round_from_checkpoint_name(path): path for path in b_paths}
+    common = sorted(r for r in a_by_round if r is not None and r in b_by_round)
+    if not common:
+        return None
+    latest = int(common[-1])
+    return latest, a_by_round[latest], b_by_round[latest]
+
+
+def _round_from_checkpoint_name(path: Path) -> int | None:
+    stem = path.stem
+    try:
+        return int(stem.rsplit("_", 1)[-1])
+    except ValueError:
+        return None
 
 
 def _file_size(path: Path | None) -> int | None:
@@ -159,7 +195,9 @@ def evaluate_challenger(
         for seed_offset in range(args.eval_seeds):
             seed = int(seed_base + opponent_idx * args.eval_seeds + seed_offset)
             scenario = generate_initial_arrays(seed, num_players=args.num_players)
-            geometry, _cache_path, _cache_loaded = build_geometry(scenario, args)
+            geometry, _cache_path, _cache_loaded = build_geometry(
+                scenario, args, cache_dir=resolve_geometry_cache_dir(args)
+            )
             result = run_array_self_play(
                 scenario=scenario,
                 geometry_cache=geometry,
@@ -211,9 +249,27 @@ def main() -> None:
     parser.add_argument("--seed-start", type=int, default=0)
     parser.add_argument("--num-players", type=int, default=4)
     parser.add_argument("--horizon-turns", type=int, default=50)
+    parser.add_argument(
+        "--explore-temperature",
+        type=float,
+        default=0.0,
+        help="Decision-time exploration for training policies (0 = greedy). Eval stays greedy.",
+    )
+    parser.add_argument(
+        "--long-horizon-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of games rolled to --long-horizon-turns for late-game state coverage.",
+    )
+    parser.add_argument("--long-horizon-turns", type=int, default=250)
     parser.add_argument("--geometry-mode", choices=["sparse", "dense"], default="sparse")
     parser.add_argument("--geometry-stride", type=int, default=1)
     parser.add_argument("--geometry-extra-turns", type=int, default=120)
+    parser.add_argument(
+        "--geometry-cache-dir",
+        default="",
+        help="Shared geometry cache dir reused across runs (default: runs/_geometry_cache).",
+    )
     parser.add_argument("--ship-buckets", default=",".join(str(x) for x in DEFAULT_SHIP_BUCKETS))
     parser.add_argument("--max-engine-steps", type=int, default=160)
     parser.add_argument("--candidate-limit", type=int, default=80)
@@ -230,30 +286,73 @@ def main() -> None:
     parser.add_argument("--accept-win-rate", type=float, default=0.55)
     parser.add_argument("--mcts-teacher-rate", type=float, default=0.0)
     parser.add_argument("--mcts-root-action-sets", type=int, default=32)
-    parser.add_argument("--mcts-opponent-samples", type=int, default=4)
-    parser.add_argument("--mcts-depth", type=int, default=1)
+    parser.add_argument(
+        "--mcts-opponent-samples",
+        type=int,
+        default=3,
+        help="Opponent continuations sampled per root action (teacher cost scales with this).",
+    )
+    parser.add_argument("--mcts-depth", type=int, default=2, help="Active-play turns before passive accrual; must be >= 2.")
+    parser.add_argument("--mcts-aggregate", choices=["mean", "min"], default="mean")
     parser.add_argument("--mcts-rollout-horizon", type=int, default=30)
     parser.add_argument("--replay-prior-checkpoint", default="")
+    parser.add_argument("--init-checkpoint-a", default="")
+    parser.add_argument("--init-checkpoint-b", default="")
     parser.add_argument("--replay-records", default="")
+    parser.add_argument("--resume-from-dir", default="")
+    parser.add_argument("--round-start", type=int, default=1)
+    parser.add_argument("--append-log", action="store_true")
     parser.add_argument("--map-pool-size", type=int, default=32)
-    parser.add_argument("--games-per-map", type=int, default=100)
+    # Default 1: visit a distinct seed each game and cycle the pool across rounds.
+    # Self-play policies are deterministic with weights frozen within a round, so
+    # repeating the same seed inside a round just replays an identical game. Set
+    # >1 only with a stochastic/exploring policy where repeats add variety.
+    parser.add_argument("--games-per-map", type=int, default=1)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+
+    if int(args.mcts_depth) < 2:
+        parser.error("--mcts-depth must be >= 2 (the teacher is policy-response only)")
 
     seed_everything(args.seed)
     out_dir = Path(args.out_dir)
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    logger = TrainingLogger(out_dir / "training.jsonl", append=False)
+    resume_round = None
+    if args.resume_from_dir:
+        latest = _latest_common_ranker_round(Path(args.resume_from_dir) / "checkpoints")
+        if latest is None:
+            raise FileNotFoundError(f"no matching A/B ranker checkpoints under {args.resume_from_dir}")
+        resume_round, resume_a, resume_b = latest
+        if not args.init_checkpoint_a:
+            args.init_checkpoint_a = str(resume_a)
+        if not args.init_checkpoint_b:
+            args.init_checkpoint_b = str(resume_b)
+        if int(args.round_start) <= 1:
+            args.round_start = int(resume_round) + 1
+        args.append_log = True
+
+    logger = TrainingLogger(out_dir / "training.jsonl", append=bool(args.append_log))
     logger.log_msg(
         "run_start",
         out_dir=out_dir,
         args=vars(args),
+        resume_round=resume_round,
         memory_bytes=_memory_bytes(),
     )
 
-    if args.replay_prior_checkpoint:
+    if args.init_checkpoint_a or args.init_checkpoint_b:
+        if not args.init_checkpoint_a or not args.init_checkpoint_b:
+            raise ValueError("--init-checkpoint-a and --init-checkpoint-b must be provided together")
+        model_a = load_ranker(args.init_checkpoint_a, map_location=args.device)
+        model_b = load_ranker(args.init_checkpoint_b, map_location=args.device)
+        logger.log_msg(
+            "loaded_policy_checkpoints",
+            checkpoint_a=args.init_checkpoint_a,
+            checkpoint_b=args.init_checkpoint_b,
+        )
+    elif args.replay_prior_checkpoint:
         model_a = load_ranker(args.replay_prior_checkpoint, map_location=args.device)
         model_b = load_ranker(args.replay_prior_checkpoint, map_location=args.device)
         logger.log_msg("loaded_replay_prior", checkpoint=args.replay_prior_checkpoint)
@@ -278,7 +377,29 @@ def main() -> None:
     incumbent_pool: list[Path] = []
 
     try:
-        for round_idx in range(1, args.rounds + 1):
+        final_round = int(args.round_start) + int(args.rounds) - 1
+        games_per_map = max(1, int(args.games_per_map))
+        map_pool_size = max(1, int(args.map_pool_size))
+        planned_seeds = {
+            args.seed_start + (((r - 1) * args.seeds_per_round + off) // games_per_map) % map_pool_size
+            for r in range(int(args.round_start), final_round + 1)
+            for off in range(args.seeds_per_round)
+        }
+        logger.log_msg(
+            "map_coverage",
+            distinct_maps=len(planned_seeds),
+            map_pool_size=map_pool_size,
+            games_per_map=games_per_map,
+            single_map_warning=len(planned_seeds) <= 1,
+        )
+        if len(planned_seeds) <= 1:
+            print(
+                "WARNING: this run trains on a single map "
+                f"(seed {sorted(planned_seeds)[0]}). Lower --games-per-map or raise "
+                "--rounds/--seeds-per-round for map diversity.",
+                file=sys.stderr,
+            )
+        for round_idx in range(int(args.round_start), final_round + 1):
             round_t0 = time.perf_counter()
             round_records: list[dict] = []
             round_deltas: list[float] = []
@@ -286,7 +407,7 @@ def main() -> None:
             logger.log_msg(
                 "round_start",
                 iter=round_idx,
-                total_rounds=args.rounds,
+                total_rounds=final_round,
                 buffer_a=len(buffer_a),
                 buffer_b=len(buffer_b),
                 replay_records=len(replay_records),
@@ -298,9 +419,18 @@ def main() -> None:
                 map_pool_size = max(1, int(args.map_pool_size))
                 games_per_map = max(1, int(args.games_per_map))
                 seed = args.seed_start + ((global_game_idx // games_per_map) % map_pool_size)
+                # Late-game state coverage: a deterministic subset of games rolls
+                # far past the default horizon so the buffer sees turns 50..500.
+                is_long = False
+                if float(args.long_horizon_fraction) > 0.0:
+                    stride = max(1, round(1.0 / float(args.long_horizon_fraction)))
+                    is_long = (global_game_idx % stride) == 0
+                game_horizon = int(args.long_horizon_turns) if is_long else int(args.horizon_turns)
                 scenario = generate_initial_arrays(seed, num_players=args.num_players)
                 geometry_t0 = time.perf_counter()
-                geometry, geometry_path, geometry_loaded = build_geometry(scenario, args, cache_dir=out_dir / "geometry")
+                geometry, geometry_path, geometry_loaded = build_geometry(
+                    scenario, args, cache_dir=resolve_geometry_cache_dir(args)
+                )
                 logger.log_msg(
                     "geometry_ready",
                     iter=round_idx,
@@ -323,15 +453,19 @@ def main() -> None:
                             policy_id="A",
                             device=args.device,
                             max_launches=args.max_launches,
+                            temperature=float(args.explore_temperature),
+                            seed=args.seed + global_game_idx * 2 + 1,
                         ),
                         "B": RankerPolicy(
                             model=model_b,
                             policy_id="B",
                             device=args.device,
                             max_launches=args.max_launches,
+                            temperature=float(args.explore_temperature),
+                            seed=args.seed + global_game_idx * 2 + 2,
                         ),
                     },
-                    horizon_turns=args.horizon_turns,
+                    horizon_turns=game_horizon,
                     candidate_limit=args.candidate_limit,
                     max_launches=args.max_launches,
                     beam_width=args.beam_width,
@@ -367,6 +501,7 @@ def main() -> None:
                         opponent_samples=args.mcts_opponent_samples,
                         depth=args.mcts_depth,
                         rollout_horizon=args.mcts_rollout_horizon,
+                        aggregate=args.mcts_aggregate,
                     )
                     records_a = [r for r in records if r.get("source", {}).get("policy_id") == "A"]
                     records_b = [r for r in records if r.get("source", {}).get("policy_id") == "B"]
@@ -410,7 +545,9 @@ def main() -> None:
                         depth=args.mcts_depth,
                         root_action_sets=args.mcts_root_action_sets,
                         rollout_horizon=args.mcts_rollout_horizon,
-                        mode="policy_response" if int(args.mcts_depth) > 1 else "root_rollout",
+                        opponent_samples=args.mcts_opponent_samples,
+                        aggregate=args.mcts_aggregate,
+                        mode="policy_response",
                     )
                 round_records.extend(records)
                 scores = seat_scores(
@@ -432,7 +569,9 @@ def main() -> None:
                     production_by_seat={seat: scores[seat]["production"] for seat in scores},
                     ships_by_seat={seat: scores[seat]["ships"] for seat in scores},
                     winner_seat=int(winner),
-                    horizon_turns=args.horizon_turns,
+                    horizon_turns=game_horizon,
+                    is_long_horizon=bool(is_long),
+                    explore_temperature=float(args.explore_temperature),
                     **policy_summary,
                     game_offset=offset,
                     records=len(records),
@@ -448,10 +587,11 @@ def main() -> None:
 
             buffer_a.extend(r for r in round_records if r.get("source", {}).get("policy_id") == "A")
             buffer_b.extend(r for r in round_records if r.get("source", {}).get("policy_id") == "B")
+            # Keep buffers in insertion order so trim_buffer evicts the oldest
+            # (FIFO) records. SGD-order shuffling happens on a per-epoch training
+            # copy below, so it never disturbs the buffer's chronology.
             trim_buffer(buffer_a, args.buffer_size)
             trim_buffer(buffer_b, args.buffer_size)
-            random.shuffle(buffer_a)
-            random.shuffle(buffer_b)
             logger.log_msg(
                 "round_score",
                 iter=round_idx,
@@ -483,8 +623,15 @@ def main() -> None:
             train_t0 = time.perf_counter()
             for epoch_idx in range(1, args.train_epochs + 1):
                 epoch_t0 = time.perf_counter()
-                stats_a = train_ranker_epoch(model_a, buffer_a + replay_records, opt_a, device=args.device)
-                stats_b = train_ranker_epoch(model_b, buffer_b + replay_records, opt_b, device=args.device)
+                # Shuffle a fresh per-epoch copy so replay rows are interleaved
+                # with self-play rows (not always trailing) and SGD order varies
+                # across epochs, while the underlying buffers stay FIFO-ordered.
+                rows_a = buffer_a + replay_records
+                rows_b = buffer_b + replay_records
+                random.shuffle(rows_a)
+                random.shuffle(rows_b)
+                stats_a = train_ranker_epoch(model_a, rows_a, opt_a, device=args.device)
+                stats_b = train_ranker_epoch(model_b, rows_b, opt_b, device=args.device)
                 logger.log_msg(
                     "train_epoch",
                     iter=round_idx,
@@ -539,10 +686,13 @@ def main() -> None:
             )
 
             if round_idx % max(1, args.eval_every) == 0:
+                # Snapshot the pool so A and B are both judged against the same
+                # incumbents; otherwise B would face A's just-accepted checkpoint.
+                eval_pool = list(incumbent_pool)
                 for policy_name, path in (("A", path_a), ("B", path_b)):
                     win_rate, mean_lead, n_games = evaluate_challenger(
                         path,
-                        incumbent_pool,
+                        eval_pool,
                         args=args,
                         seed_base=args.seed_start + 100_000 + round_idx * 1000 + (0 if policy_name == "A" else 500),
                     )

@@ -61,6 +61,13 @@ class RankerPolicy:
     device: str = "cpu"
     max_launches: int = 10
     multi_source_bonus: float = 0.15
+    temperature: float = 0.0
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        # Decision-time exploration: temperature>0 perturbs candidate ordering so
+        # self-play visits a wider action space. Eval/yardstick leave it at 0.
+        self._rng = np.random.default_rng(int(self.seed)) if float(self.temperature) > 0.0 else None
 
     def choose(self, record: dict[str, Any]) -> dict[str, Any]:
         scores = score_candidates(self.model, record, device=self.device)
@@ -69,6 +76,8 @@ class RankerPolicy:
             scores,
             max_launches=self.max_launches,
             multi_source_bonus=self.multi_source_bonus,
+            temperature=self.temperature,
+            rng=self._rng,
         )
 
 

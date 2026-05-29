@@ -201,6 +201,8 @@ def step_multi_seat(
     seat_launches: Iterable[PendingLaunch],
     *,
     current_rel_turn: int,
+    active_mask: np.ndarray | None = None,
+    arrival_active_mask: np.ndarray | None = None,
 ) -> int:
     """Apply one turn of multi-seat self-play to the array state in-place.
 
@@ -220,6 +222,8 @@ def step_multi_seat(
     """
     for launch in seat_launches:
         src = int(launch.source_idx)
+        if active_mask is not None and (src < 0 or src >= len(active_mask) or not bool(active_mask[src])):
+            continue
         amount = int(min(int(launch.ships), max(int(ships[src]), 0)))
         if amount <= 0:
             continue
@@ -238,9 +242,18 @@ def step_multi_seat(
 
     new_rel_turn = int(current_rel_turn) + 1
     owned = owners >= 0
+    if active_mask is not None:
+        owned = owned & active_mask.astype(bool, copy=False)
     ships[owned] += production[owned]
     arrivals = schedule.get(new_rel_turn)
     if arrivals:
+        if arrival_active_mask is not None:
+            arrivals = [
+                a
+                for a in arrivals
+                if 0 <= int(a.target_idx) < len(arrival_active_mask)
+                and bool(arrival_active_mask[int(a.target_idx)])
+            ]
         _resolve_combat(owners, ships, arrivals)
     return new_rel_turn
 

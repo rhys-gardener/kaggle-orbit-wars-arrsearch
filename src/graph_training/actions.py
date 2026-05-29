@@ -219,7 +219,7 @@ def generate_launch_candidates(
     solve_cache: dict[tuple[int, int, int], tuple[float, int | None, str, int]] = {}
     planet_by_id = ctx.planet_by_id
     my_planets = ctx.my_planets
-    non_owned = [p for p in ctx.planets if int(p[1]) != ctx.player and int(p[0]) not in ctx.comet_ids]
+    non_owned = [p for p in ctx.planets if int(p[1]) != ctx.player]
 
     for source in my_planets:
         if int(source[0]) in ctx.comet_ids:
@@ -423,7 +423,7 @@ def generate_cached_launch_candidates(
 
     candidates: list[LaunchCandidate] = []
     my_planets = ctx.my_planets
-    non_owned = [p for p in ctx.planets if int(p[1]) != ctx.player and int(p[0]) not in ctx.comet_ids]
+    non_owned = [p for p in ctx.planets if int(p[1]) != ctx.player]
     bucket_values = [int(x) for x in geometry_cache.ship_buckets.tolist()]
 
     for source in my_planets:

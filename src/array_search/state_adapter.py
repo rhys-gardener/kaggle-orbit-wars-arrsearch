@@ -47,7 +47,7 @@ def _advance_raw_comets(raw_comets: list[dict], rel_step: int) -> list[dict]:
         if not group.get("paths"):
             continue
         new_index = int(group.get("path_index", 0)) + int(rel_step)
-        if any(new_index >= len(path) for path in group["paths"]):
+        if new_index < 0 or any(new_index >= len(path) for path in group["paths"]):
             continue
         group_copy = copy.deepcopy(group)
         group_copy["path_index"] = new_index
@@ -65,6 +65,14 @@ def _comet_position_at(scenario: InitialScenario, planet_id: int, rel_step: int)
                 return float(path[idx][0]), float(path[idx][1])
             return None
     return None
+
+
+def _planet_position_at(scenario: InitialScenario, idx: int, rel_step: int) -> tuple[float, float] | None:
+    pid = int(scenario.planet_ids[int(idx)])
+    if pid in scenario.comet_planet_ids:
+        return _comet_position_at(scenario, pid, rel_step)
+    positions = planet_positions_at(scenario, rel_step)
+    return float(positions[int(idx), 0]), float(positions[int(idx), 1])
 
 
 def _build_planet(
@@ -116,9 +124,11 @@ def _synthesise_fleet(
     if tgt_idx < 0 or tgt_idx >= len(scenario.planet_ids):
         return None
 
-    launch_positions = planet_positions_at(scenario, entry.launch_rel_turn)
-    sx = float(launch_positions[src_idx, 0])
-    sy = float(launch_positions[src_idx, 1])
+    source_pos = _planet_position_at(scenario, src_idx, entry.launch_rel_turn)
+    target_pos = _planet_position_at(scenario, tgt_idx, entry.launch_rel_turn)
+    if source_pos is None or target_pos is None:
+        return None
+    sx, sy = source_pos
     src_radius = float(scenario.radii[src_idx])
 
     # Build a target-planet list reflecting state at launch time so intercept
@@ -126,14 +136,18 @@ def _synthesise_fleet(
     tgt_planet = [
         int(scenario.planet_ids[tgt_idx]),
         -1,  # owner irrelevant to intercept
-        float(launch_positions[tgt_idx, 0]),
-        float(launch_positions[tgt_idx, 1]),
+        float(target_pos[0]),
+        float(target_pos[1]),
         float(scenario.radii[tgt_idx]),
         0.0,
         0.0,
     ]
     raw_comets_at_launch = _advance_raw_comets(scenario.raw_comets, entry.launch_rel_turn)
-    comet_ids = set(scenario.comet_planet_ids)
+    comet_ids = {
+        int(pid)
+        for group in raw_comets_at_launch
+        for pid in group.get("planet_ids", [])
+    }
 
     tx, ty, _eta = intercept(
         sx, sy, tgt_planet, scenario.angular_velocity, int(entry.ships),
@@ -218,6 +232,11 @@ def arrays_to_obs(
                 fid += 1
 
     raw_comets = _advance_raw_comets(scenario.raw_comets, rel_step)
+    active_comet_ids = [
+        int(pid)
+        for group in raw_comets
+        for pid in group.get("planet_ids", [])
+    ]
 
     return {
         "step": int(scenario.step + rel_step),
@@ -226,5 +245,5 @@ def arrays_to_obs(
         "planets": planets,
         "fleets": fleets,
         "comets": raw_comets,
-        "comet_planet_ids": list(scenario.comet_planet_ids),
+        "comet_planet_ids": active_comet_ids,
     }

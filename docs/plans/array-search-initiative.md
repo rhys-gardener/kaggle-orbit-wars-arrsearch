@@ -96,7 +96,85 @@ From `src/graph_training/`:
 - [geometry_cache.py](../../src/graph_training/geometry_cache.py) — closed-form
   precomputation over `(step, source, target, ship_bucket)`.
 
-## Gaps to fill (build order)
+From `src/array_search/` and `scripts/`:
+
+- [scenarios.py](../../src/array_search/scenarios.py) - step-0 scenario
+  generation from `sim.make_env(seed).reset(...)`.
+- [state_adapter.py](../../src/array_search/state_adapter.py) - arrays back to
+  kaggle-shaped obs dicts for `build_graph_state`.
+- [action_filters.py](../../src/array_search/action_filters.py) - strict/lax
+  launch filters from replay action stats.
+- [records.py](../../src/array_search/records.py) - serialisation helpers for
+  graph/candidate/action-set training rows.
+- [labels.py](../../src/array_search/labels.py) - rollout labels over H in
+  `{30, 60, 120}`, with H=60 as the primary target.
+- [features.py](../../src/array_search/features.py) - candidate-as-row feature
+  construction for the invariant ranker.
+- [ranker.py](../../src/array_search/ranker.py) - `Linear(m,64) -> ReLU ->
+  Linear(64,64) -> ReLU -> Linear(64,1)` listwise ranker.
+- [self_play.py](../../src/array_search/self_play.py) - array-only rollout
+  driver, ranker/random/heuristic policies, and two-policy seat rotation.
+- [build_graph_array_scenarios.py](../../scripts/build_graph_array_scenarios.py)
+  - end-to-end scenario cache builder.
+- [train_ranker.py](../../scripts/train_ranker.py) - standalone cached-record
+  ranker trainer.
+- [run_self_play_loop.py](../../scripts/run_self_play_loop.py) - concurrent
+  two-ranker self-play with separate optimisers/replay buffers and an
+  incumbent-pool acceptance gate.
+- [array_tournament.py](../../scripts/array_tournament.py) - array-only
+  checkpoint-vs-checkpoint/heuristic tournament harness.
+
+## Implementation Status
+
+As of 2026-05-26, gaps 1-7 below are implemented and smoke-tested. The array
+training loop is ready to run locally. Verification completed:
+
+- `uv run python -m compileall src scripts`
+- `uv run pytest` (63 passed)
+- Tiny labelled scenario-cache build
+- Tiny ranker training pass
+- Tiny checkpoint-vs-heuristic tournament
+- Tiny two-ranker self-play loop with acceptance-gate bootstrap
+
+Current caveat: the first real training runs should be treated as calibration
+runs. The loop is wired, but we still need to inspect throughput, label
+quality, acceptance frequency, and whether the array-only combat/trajectory
+approximations produce useful policy pressure at scale.
+
+### Starter Training Command
+
+Recommended first calibration run:
+
+```bash
+uv run python scripts/run_self_play_loop.py \
+  --out-dir runs/array_self_play_calib_001 \
+  --rounds 20 \
+  --seeds-per-round 4 \
+  --num-players 4 \
+  --horizon-turns 50 \
+  --geometry-stride 1 \
+  --geometry-extra-turns 120 \
+  --candidate-limit 80 \
+  --max-launches 10 \
+  --beam-width 32 \
+  --max-same-target 3 \
+  --eval-every 5 \
+  --eval-seeds 2 \
+  --eval-horizon-turns 120
+```
+
+Outputs:
+
+- JSONL training log: `runs/array_self_play_calib_001/training.jsonl`
+- Ranker checkpoints: `runs/array_self_play_calib_001/checkpoints/*.pt`
+- Each log line has a `t` event type: `game`, `iter`, `eval`, or `msg`.
+
+If throughput looks healthy, scale by increasing `--rounds` and
+`--seeds-per-round`; a 10k-record run is roughly
+`--rounds 50 --seeds-per-round 1 --horizon-turns 50 --num-players 4`, or
+equivalently fewer rounds with more seeds per round.
+
+## Completed Gaps (build order)
 
 1. **Random initial-scenario generator.** Use `sim.make_env(seed).reset()` and
    read the step-0 obs. No `.step()` calls. Wrap the result as the array tuple
@@ -229,9 +307,12 @@ Implemented in [array_env.py:153](../../src/graph_training/array_env.py#L153)
   the inference must produce the same destination we scheduled. Test:
   after `schedule_action_set`, the next-turn `build_graph_state` must list
   the same target.
-- **Comet handling.** Comets are in `obs["comets"][i]["paths"]`. The geometry
-  cache supports this, but the array adapter must thread comet paths through
-  consistently across turns.
+- **Comet handling.** Future comet groups are precomputed from the initial
+  scenario seed and stored with negative `path_index` offsets, so they become
+  visible at steps 50, 150, 250, 350, and 450 without stepping the env.
+- **Exact geometry cost.** The default geometry stride is 1. Larger strides are
+  an explicit approximation for speed experiments, not the trusted training
+  path.
 - **Reward hacking by rollout horizon.** Production-at-H=30 favours opportunistic
   captures the model might not be able to hold. Mitigate with multi-horizon
   labels (H ∈ {30, 60, 120}) and a survival penalty.
